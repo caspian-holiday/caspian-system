@@ -1,0 +1,17 @@
+### VMJ sidecar endpoint tests for IntelliJ HTTP Client
+### 1) Start scheduler service locally (without vmauth/vmagent)
+### 2) Generate binary remote-write payload files:
+###    python scripts/generate_remote_write_payloads.py
+### 3) Run requests below
+
+@baseUrl = http://localhost:8000
+
+### Health check
+GET {{baseUrl}}/vmj/health
+
+### sidecar write path (expects biz_date label)
+POST {{baseUrl}}/vmj/api/v1/write
+Content-Type: application/x-protobuf
+Content-Encoding: snappy
+
+< ../tmp/biz_date_remote_write.bin

@@ -1,0 +1,27 @@
+### Remote client-side stress test via vmauth (IntelliJ HTTP Client)
+###
+### 1) Generate 1k Prometheus-text metrics payload (client-style):
+###    python tests/generators/biz_date_input_generator.py \
+###      --job "producer_a" \
+###      --last-days 30 \
+###      --metric-count 1000 \
+###      --metric-prefix "vmj_stress_metric" \
+###      --output tmp/vmauth_prometheus_text_1k.txt
+###
+### 2) Set params below for your target vmauth endpoint/token.
+### 3) Send request to push the full block through vmauth -> vmagent -> sidecar.
+
+@remoteVmUrl = https://your-vmauth-host
+@token = replace_me
+@jobName = producer_a
+
+### Optional read probe through vmauth (adjust selector if needed)
+GET {{remoteVmUrl}}/api/v1/query?query=count({job="{{jobName}}"})
+Authorization: Bearer {{token}}
+
+### Write 1k metrics (Prometheus text format with biz_date labels) through vmauth
+POST {{remoteVmUrl}}/api/v1/import/prometheus
+Authorization: Bearer {{token}}
+Content-Type: text/plain
+
+< ../tmp/vmauth_prometheus_text_1k.txt
