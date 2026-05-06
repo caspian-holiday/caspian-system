@@ -3,7 +3,8 @@
 Generate local test payloads for VMJ sidecar write endpoints.
 
 Outputs:
-- tmp/biz_date_remote_write.bin
+- Binary remote-write payload (protobuf + snappy), e.g. tmp/biz_date_remote_write.bin
+- Optional Prometheus text payload, e.g. tmp/biz_date_prometheus_text.txt
 """
 
 from __future__ import annotations
@@ -98,6 +99,33 @@ def _build_payload(
     return snappy.compress(request_obj.SerializeToString())
 
 
+def _build_prometheus_text_payload(
+    series_entries: list[tuple[dict[str, str], float, int]],
+) -> str:
+    lines: list[str] = []
+    for labels, value, _ts_ms in series_entries:
+        metric_name = labels.get("__name__")
+        if not metric_name:
+            raise ValueError("Each series entry must include __name__ label")
+
+        text_labels: list[str] = []
+        for key in sorted(labels.keys()):
+            if key == "__name__":
+                continue
+            label_value = labels[key]
+            escaped_value = (
+                label_value.replace("\\", "\\\\")
+                .replace("\n", "\\n")
+                .replace('"', '\\"')
+            )
+            text_labels.append(f'{key}="{escaped_value}"')
+
+        label_suffix = f'{{{",".join(text_labels)}}}' if text_labels else ""
+        lines.append(f"{metric_name}{label_suffix} {value}")
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate remote-write payloads for sidecar/vmauth tests")
     parser.add_argument(
@@ -126,6 +154,11 @@ def main() -> None:
         "--output",
         default="tmp/biz_date_remote_write_1k.bin",
         help="Output binary payload path (default: tmp/biz_date_remote_write_1k.bin)",
+    )
+    parser.add_argument(
+        "--text-output",
+        default=None,
+        help="Optional output path for Prometheus text payload (e.g. tmp/biz_date_prometheus_text_1k.txt)",
     )
     args = parser.parse_args()
 
@@ -162,6 +195,13 @@ def main() -> None:
     biz_path.write_bytes(biz_date_payload)
 
     print(f"Wrote {biz_path}")
+    if args.text_output:
+        text_payload = _build_prometheus_text_payload(biz_date_entries)
+        text_path = Path(args.text_output)
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text_payload, encoding="utf-8")
+        print(f"Wrote {text_path}")
+
     print(f"biz_date series count: {len(biz_date_entries)}")
 
 
