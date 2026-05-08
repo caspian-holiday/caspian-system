@@ -84,9 +84,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--lookback-days",
         type=int,
-        default=365,
+        default=30,
         dest="lookback_days",
-        help="How far back the /api/v1/series listing window extends (default: 365).",
+        help=(
+            "How far back the /api/v1/series listing window extends, in days. "
+            "Defaults to 30 ('last month' of submitted samples)."
+        ),
     )
 
     mode = parser.add_mutually_exclusive_group()
@@ -148,8 +151,12 @@ def list_series(
     lookback_days: int,
     logger: logging.Logger,
 ) -> List[Dict[str, str]]:
-    """List exact series for {job=..., biz_date!=''} over a lookback window."""
-    selector = f'{{job="{job}",biz_date!=""}}'
+    """List every series for {job=...} that had a sample submitted in the lookback window.
+
+    Intentionally does NOT filter by biz_date label: all biz_date comparison is
+    done locally by the caller after this function returns.
+    """
+    selector = f'{{job="{job}"}}'
     if metric_name:
         selector = f"{metric_name}{selector}"
 
@@ -183,25 +190,37 @@ def filter_series_by_biz_date(
     op_name: str,
     threshold: date,
     logger: logging.Logger,
-) -> Tuple[List[Dict[str, str]], int]:
-    """Return (matched, skipped) where skipped counts unparseable/missing biz_date."""
+) -> Tuple[List[Dict[str, str]], int, int]:
+    """Compare biz_date label locally for every series in series_list.
+
+    Returns:
+        (matched, skipped_no_biz_date, skipped_unparseable)
+        - matched: series whose biz_date satisfies `op` against `threshold`.
+        - skipped_no_biz_date: series with no biz_date label at all (expected
+          for jobs that emit non-bd-aware metrics; logged at debug).
+        - skipped_unparseable: series with a biz_date label that did not parse
+          as dd/mm/yyyy (logged at warning since that's a data quality signal).
+    """
     cmp = OPS[op_name]
     matched: List[Dict[str, str]] = []
-    skipped = 0
+    skipped_no_biz_date = 0
+    skipped_unparseable = 0
     for labels in series_list:
         raw = labels.get("biz_date")
+        if raw is None or raw == "":
+            skipped_no_biz_date += 1
+            logger.debug("Skipping series with no biz_date label: %s", labels)
+            continue
         bd = safe_parse_biz_date(raw)
         if bd is None:
-            skipped += 1
+            skipped_unparseable += 1
             logger.warning(
-                "Skipping series with missing/unparseable biz_date: raw=%r labels=%s",
-                raw,
-                labels,
+                "Skipping series with unparseable biz_date %r: %s", raw, labels
             )
             continue
         if cmp(bd, threshold):
             matched.append(labels)
-    return matched, skipped
+    return matched, skipped_no_biz_date, skipped_unparseable
 
 
 def labels_to_match_selector(labels: Dict[str, str]) -> str:
@@ -300,7 +319,7 @@ def run(args: argparse.Namespace) -> int:
 
     logger.info("Listed %d series", len(series_list))
 
-    matched, skipped = filter_series_by_biz_date(
+    matched, skipped_no_biz_date, skipped_unparseable = filter_series_by_biz_date(
         series_list=series_list,
         op_name=args.op,
         threshold=args.threshold_date,
@@ -308,9 +327,10 @@ def run(args: argparse.Namespace) -> int:
     )
 
     logger.info(
-        "Matched %d series (skipped %d with missing/unparseable biz_date)",
+        "Matched %d series (skipped %d with no biz_date label, %d with unparseable biz_date)",
         len(matched),
-        skipped,
+        skipped_no_biz_date,
+        skipped_unparseable,
     )
 
     if not matched:
@@ -345,7 +365,8 @@ def run(args: argparse.Namespace) -> int:
 
     print(
         f"Done. matched={len(matched)} deleted={deleted} failed={failed} "
-        f"skipped_unparseable={skipped}"
+        f"skipped_no_biz_date={skipped_no_biz_date} "
+        f"skipped_unparseable={skipped_unparseable}"
     )
 
     return 0 if failed == 0 else 1
