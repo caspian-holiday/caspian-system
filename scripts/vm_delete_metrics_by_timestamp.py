@@ -4,9 +4,17 @@ Maintenance script: list and delete Victoria Metrics series for a given job
 that had a sample at a specific integer-second timestamp (no ms part).
 
 The user supplies --ts as a whole number of seconds (e.g. 1775409800). The
-script translates that into a [ts, ts+0.999] window on /api/v1/series, so
-every sample timestamp inside that integer second matches -- including
-ts itself (no fractional), ts.0, ts.123, ts.999, etc.
+script auto-matches the bare value AND every fractional/millisecond variant
+within that second (ts, ts.0, ts.123, ts.999).
+
+Why /api/v1/export and not /api/v1/series:
+    /api/v1/series is an index lookup with built-in staleness tolerance, so
+    a series whose nearest sample is slightly outside the requested window
+    can still appear in its result. /api/v1/export, on the other hand,
+    returns the raw per-sample timestamps for each series, which we then
+    filter locally with strict ms-precision: keep only series with at least
+    one sample in [ts*1000, ts*1000+999] inclusive. That gives an exact
+    match independent of VM's index behaviour.
 
 Note on deletion semantics:
     Victoria Metrics' /api/v1/admin/tsdb/delete_series API drops the ENTIRE
@@ -20,6 +28,7 @@ Dry-run is the default; --apply is required to actually delete.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -148,38 +157,75 @@ def build_session(vm_token: str) -> requests.Session:
     return session
 
 
-def list_series_at_second(
+def list_series_with_sample_at_second(
     session: requests.Session,
     base_url: str,
     job: str,
     metric_name: str,
     ts_int: int,
     logger: logging.Logger,
-) -> List[Dict[str, str]]:
-    """List every series for {job=...} with at least one sample in [ts, ts+0.999].
+) -> List[Tuple[Dict[str, str], List[int]]]:
+    """List series for {job=...} that have at least one sample in [ts, ts+0.999].
 
-    The half-open-ish window over the integer second is what gives us "match
-    the bare ts AND every .xxx ms variation" without doing any local filter
-    work or PromQL gymnastics.
+    Uses /api/v1/export so we see every sample's actual ms timestamp, then
+    filters locally with exact ms precision. The server-side window is set
+    slightly wider ([ts-1, ts+1] seconds) to absorb any rounding VM might
+    apply to the export start/end, since the strict filter is then re-applied
+    locally.
+
+    Returns:
+        A list of (labels, matched_ts_ms) pairs, where:
+        - labels includes __name__ and every label of the series
+        - matched_ts_ms is the sorted list of sample timestamps (in ms) that
+          fell inside the [ts*1000, ts*1000+999] window
     """
     selector = f'{{job="{job}"}}'
     if metric_name:
         selector = f"{metric_name}{selector}"
 
-    start_param = str(ts_int)
-    end_param = f"{ts_int}.999"
+    server_start_s = max(0, ts_int - 1)
+    server_end_s = ts_int + 1
 
-    params = {"match[]": selector, "start": start_param, "end": end_param}
-    logger.debug("GET %s/api/v1/series params=%s", base_url, params)
+    window_ms_start = ts_int * 1000
+    window_ms_end = ts_int * 1000 + 999
 
-    resp = session.get(f"{base_url}/api/v1/series", params=params, timeout=60)
+    params = {
+        "match[]": selector,
+        "start": str(server_start_s),
+        "end": str(server_end_s),
+    }
+    logger.debug("GET %s/api/v1/export params=%s", base_url, params)
+
+    resp = session.get(f"{base_url}/api/v1/export", params=params, timeout=60)
     resp.raise_for_status()
 
-    payload = resp.json()
-    if payload.get("status") != "success":
-        raise RuntimeError(f"VM /api/v1/series returned non-success: {payload}")
+    matched: List[Tuple[Dict[str, str], List[int]]] = []
+    for line in resp.text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            logger.warning("Skipping un-parseable export line: %s", exc)
+            continue
 
-    return payload.get("data", []) or []
+        metric = row.get("metric") or {}
+        if not metric.get("__name__"):
+            continue
+
+        timestamps = row.get("timestamps") or []
+        in_window = [
+            int(ts)
+            for ts in timestamps
+            if window_ms_start <= int(ts) <= window_ms_end
+        ]
+        if not in_window:
+            continue
+
+        labels = dict(metric)
+        matched.append((labels, sorted(in_window)))
+
+    return matched
 
 
 def labels_to_match_selector(labels: Dict[str, str]) -> str:
@@ -257,18 +303,20 @@ def run(args: argparse.Namespace) -> int:
     session = build_session(args.vm_token)
 
     iso = datetime.fromtimestamp(args.ts_int, tz=timezone.utc).isoformat()
+    window_ms_start = args.ts_int * 1000
+    window_ms_end = args.ts_int * 1000 + 999
     logger.info(
-        "Listing series for job=%s ts=%d (%s) window=[%d, %d.999] (vm=%s)",
+        "Listing series for job=%s ts=%d (%s) window_ms=[%d, %d] (vm=%s)",
         args.job,
         args.ts_int,
         iso,
-        args.ts_int,
-        args.ts_int,
+        window_ms_start,
+        window_ms_end,
         base_url,
     )
 
     try:
-        series_list = list_series_at_second(
+        matched_series = list_series_with_sample_at_second(
             session=session,
             base_url=base_url,
             job=args.job,
@@ -280,33 +328,40 @@ def run(args: argparse.Namespace) -> int:
         logger.error("Failed to list series: %s", exc)
         return 2
 
-    logger.info("Matched %d series at second %d", len(series_list), args.ts_int)
+    logger.info(
+        "Matched %d series with at least one sample in ms window [%d, %d]",
+        len(matched_series),
+        window_ms_start,
+        window_ms_end,
+    )
 
-    if not series_list:
+    if not matched_series:
         print(f"No series had a sample at second {args.ts_int}; nothing to do.")
         return 0
 
     if args.dry_run:
         print(
-            f"[DRY RUN] {len(series_list)} series had a sample at second "
-            f"{args.ts_int} ({iso}) and would be DELETED ENTIRELY:"
+            f"[DRY RUN] {len(matched_series)} series had a sample in ms window "
+            f"[{window_ms_start}, {window_ms_end}] (second {args.ts_int}, {iso}) "
+            f"and would be DELETED ENTIRELY:"
         )
-        for labels in series_list:
-            print(format_series_line(labels))
+        for labels, in_window_ms in matched_series:
+            ts_repr = ",".join(str(t) for t in in_window_ms)
+            print(f"{format_series_line(labels)}  matched_ts_ms=[{ts_repr}]")
         print(
-            f"[DRY RUN] Total: {len(series_list)} series. Re-run with --apply "
+            f"[DRY RUN] Total: {len(matched_series)} series. Re-run with --apply "
             f"to delete. Note: delete_series drops the whole series, not just "
             f"the targeted second."
         )
         return 0
 
-    if not args.yes and not confirm_interactive(len(series_list), args.ts_int):
+    if not args.yes and not confirm_interactive(len(matched_series), args.ts_int):
         print("Aborted by user; no series deleted.")
         return 1
 
     deleted = 0
     failed = 0
-    for labels in series_list:
+    for labels, _in_window_ms in matched_series:
         match_selector = labels_to_match_selector(labels)
         ok, status_code, reason = delete_series(session, base_url, match_selector, logger)
         if ok:
@@ -316,7 +371,7 @@ def run(args: argparse.Namespace) -> int:
             failed += 1
             print(f"FAIL [{status_code}] {match_selector} :: {reason}")
 
-    print(f"Done. matched={len(series_list)} deleted={deleted} failed={failed}")
+    print(f"Done. matched={len(matched_series)} deleted={deleted} failed={failed}")
     return 0 if failed == 0 else 1
 
 
