@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
 Maintenance script: list and delete Victoria Metrics series for a given job
-filtered by the biz_date label (dd/mm/yyyy) using a comparison operator.
+that had a sample at a specific integer-second timestamp (no ms part).
 
-The script lists exact series via /api/v1/series, filters them by parsing the
-biz_date label, and then issues one delete per matched series via
-/api/v1/admin/tsdb/delete_series with a fully-qualified match[] containing
-every label of that series.
+The user supplies --ts as a whole number of seconds (e.g. 1775409800). The
+script translates that into a [ts, ts+0.999] window on /api/v1/series, so
+every sample timestamp inside that integer second matches -- including
+ts itself (no fractional), ts.0, ts.123, ts.999, etc.
+
+Note on deletion semantics:
+    Victoria Metrics' /api/v1/admin/tsdb/delete_series API drops the ENTIRE
+    series matching a selector; it does not accept a time range. So matched
+    series are deleted in their entirety, not just the samples in the
+    targeted second. The dry-run output and final summary say this loudly.
 
 Dry-run is the default; --apply is required to actually delete.
 """
@@ -15,56 +21,47 @@ from __future__ import annotations
 
 import argparse
 import logging
-import operator
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
 
-OPS: Dict[str, Callable[[date, date], bool]] = {
-    "gt": operator.gt,
-    "lt": operator.lt,
-    "ge": operator.ge,
-    "le": operator.le,
-    "eq": operator.eq,
-}
-
-
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="vm_delete_metrics_by_biz_date.py",
+        prog="vm_delete_metrics_by_timestamp.py",
         description=(
-            "Delete Victoria Metrics series for a job, filtered by the "
-            "biz_date label (dd/mm/yyyy) using a comparison operator. "
-            "Defaults to dry-run."
+            "Delete Victoria Metrics series for a job that had a sample at a "
+            "specific integer-second timestamp. The integer second matches the "
+            "bare value AND every fractional/millisecond variant within that "
+            "second (ts, ts.0, ts.123, ts.999, ...). Defaults to dry-run."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # Preview series with biz_date older than 01/05/2025\n"
-            "  vm_delete_metrics_by_biz_date.py --job apex_collector --op lt --biz-date 01/05/2025\n\n"
+            "  # Preview series with a sample at integer second 1775409800\n"
+            "  vm_delete_metrics_by_timestamp.py --job apex_collector --ts 1775409800\n\n"
             "  # Actually delete them (interactive confirmation)\n"
-            "  vm_delete_metrics_by_biz_date.py --job apex_collector --op lt --biz-date 01/05/2025 --apply\n\n"
+            "  vm_delete_metrics_by_timestamp.py --job apex_collector --ts 1775409800 --apply\n\n"
             "  # Apply non-interactively\n"
-            "  vm_delete_metrics_by_biz_date.py --job apex_collector --op lt --biz-date 01/05/2025 --apply --yes\n"
+            "  vm_delete_metrics_by_timestamp.py --job apex_collector --ts 1775409800 --apply --yes\n\n"
+            "WARNING: VM's delete_series drops the entire matched series, not\n"
+            "only the sample at the targeted second. Any other samples those\n"
+            "series have at other timestamps will be deleted as well.\n"
         ),
     )
 
     parser.add_argument("--job", required=True, help="Job label value to filter by (job=<JOB>).")
     parser.add_argument(
-        "--op",
+        "--ts",
         required=True,
-        choices=sorted(OPS.keys()),
-        help="Comparison operator applied to biz_date: gt, lt, ge, le, eq.",
-    )
-    parser.add_argument(
-        "--biz-date",
-        required=True,
-        dest="biz_date",
-        help="Threshold biz_date in dd/mm/yyyy format.",
+        help=(
+            "Integer Unix timestamp in seconds, with NO fractional/ms part "
+            "(e.g. 1775409800). The script auto-matches every .xxx variation "
+            "within that second."
+        ),
     )
     parser.add_argument(
         "--vm-url",
@@ -84,16 +81,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--metric",
         default="",
         help="Optional metric name filter (e.g. my_metric); default no filter.",
-    )
-    parser.add_argument(
-        "--lookback-days",
-        type=int,
-        default=30,
-        dest="lookback_days",
-        help=(
-            "How far back the /api/v1/series listing window extends, in days. "
-            "Defaults to 30 ('last month' of submitted samples)."
-        ),
     )
 
     mode = parser.add_mutually_exclusive_group()
@@ -123,10 +110,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if not args.vm_url:
         parser.error("--vm-url is required (or set $VM_JOBS_VM_QUERY_URL)")
 
+    if "." in args.ts:
+        parser.error(
+            f"--ts must be an integer number of seconds with NO ms part; got {args.ts!r}. "
+            "All .xxx variations are matched automatically."
+        )
     try:
-        args.threshold_date = datetime.strptime(args.biz_date, "%d/%m/%Y").date()
+        args.ts_int = int(args.ts)
     except ValueError:
-        parser.error(f"--biz-date must be in dd/mm/yyyy format, got: {args.biz_date}")
+        parser.error(f"--ts must be a whole integer (seconds since epoch); got {args.ts!r}")
+
+    if args.ts_int <= 0:
+        parser.error(f"--ts must be a positive integer; got {args.ts_int}")
 
     return args
 
@@ -153,27 +148,28 @@ def build_session(vm_token: str) -> requests.Session:
     return session
 
 
-def list_series(
+def list_series_at_second(
     session: requests.Session,
     base_url: str,
     job: str,
     metric_name: str,
-    lookback_days: int,
+    ts_int: int,
     logger: logging.Logger,
 ) -> List[Dict[str, str]]:
-    """List every series for {job=...} that had a sample submitted in the lookback window.
+    """List every series for {job=...} with at least one sample in [ts, ts+0.999].
 
-    Intentionally does NOT filter by biz_date label: all biz_date comparison is
-    done locally by the caller after this function returns.
+    The half-open-ish window over the integer second is what gives us "match
+    the bare ts AND every .xxx ms variation" without doing any local filter
+    work or PromQL gymnastics.
     """
     selector = f'{{job="{job}"}}'
     if metric_name:
         selector = f"{metric_name}{selector}"
 
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-    start_ts = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+    start_param = str(ts_int)
+    end_param = f"{ts_int}.999"
 
-    params = {"match[]": selector, "start": str(start_ts), "end": str(end_ts)}
+    params = {"match[]": selector, "start": start_param, "end": end_param}
     logger.debug("GET %s/api/v1/series params=%s", base_url, params)
 
     resp = session.get(f"{base_url}/api/v1/series", params=params, timeout=60)
@@ -184,53 +180,6 @@ def list_series(
         raise RuntimeError(f"VM /api/v1/series returned non-success: {payload}")
 
     return payload.get("data", []) or []
-
-
-def safe_parse_biz_date(raw: Optional[str]) -> Optional[date]:
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(raw, "%d/%m/%Y").date()
-    except ValueError:
-        return None
-
-
-def filter_series_by_biz_date(
-    series_list: List[Dict[str, str]],
-    op_name: str,
-    threshold: date,
-    logger: logging.Logger,
-) -> Tuple[List[Dict[str, str]], int, int]:
-    """Compare biz_date label locally for every series in series_list.
-
-    Returns:
-        (matched, skipped_no_biz_date, skipped_unparseable)
-        - matched: series whose biz_date satisfies `op` against `threshold`.
-        - skipped_no_biz_date: series with no biz_date label at all (expected
-          for jobs that emit non-bd-aware metrics; logged at debug).
-        - skipped_unparseable: series with a biz_date label that did not parse
-          as dd/mm/yyyy (logged at warning since that's a data quality signal).
-    """
-    cmp = OPS[op_name]
-    matched: List[Dict[str, str]] = []
-    skipped_no_biz_date = 0
-    skipped_unparseable = 0
-    for labels in series_list:
-        raw = labels.get("biz_date")
-        if raw is None or raw == "":
-            skipped_no_biz_date += 1
-            logger.debug("Skipping series with no biz_date label: %s", labels)
-            continue
-        bd = safe_parse_biz_date(raw)
-        if bd is None:
-            skipped_unparseable += 1
-            logger.warning(
-                "Skipping series with unparseable biz_date %r: %s", raw, labels
-            )
-            continue
-        if cmp(bd, threshold):
-            matched.append(labels)
-    return matched, skipped_no_biz_date, skipped_unparseable
 
 
 def labels_to_match_selector(labels: Dict[str, str]) -> str:
@@ -278,10 +227,12 @@ def delete_series(
     return False, resp.status_code, resp.text.strip()[:200]
 
 
-def confirm_interactive(matched_count: int, op_name: str, threshold: date) -> bool:
+def confirm_interactive(matched_count: int, ts_int: int) -> bool:
+    iso = datetime.fromtimestamp(ts_int, tz=timezone.utc).isoformat()
     prompt = (
-        f"About to delete {matched_count} series where biz_date {op_name} "
-        f"{threshold.strftime('%d/%m/%Y')}. Continue? [y/N]: "
+        f"About to delete {matched_count} series that had a sample at integer second "
+        f"{ts_int} ({iso}). VM deletes drop the WHOLE series, not just that second. "
+        f"Continue? [y/N]: "
     )
     try:
         answer = input(prompt)
@@ -297,7 +248,7 @@ def configure_logging(verbose: bool) -> logging.Logger:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    return logging.getLogger("vm_delete_by_biz_date")
+    return logging.getLogger("vm_delete_by_timestamp")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -305,65 +256,57 @@ def run(args: argparse.Namespace) -> int:
     base_url = normalize_base_url(args.vm_url)
     session = build_session(args.vm_token)
 
+    iso = datetime.fromtimestamp(args.ts_int, tz=timezone.utc).isoformat()
     logger.info(
-        "Listing series for job=%s op=%s biz_date_threshold=%s lookback_days=%d (vm=%s)",
+        "Listing series for job=%s ts=%d (%s) window=[%d, %d.999] (vm=%s)",
         args.job,
-        args.op,
-        args.threshold_date.strftime("%d/%m/%Y"),
-        args.lookback_days,
+        args.ts_int,
+        iso,
+        args.ts_int,
+        args.ts_int,
         base_url,
     )
 
     try:
-        series_list = list_series(
+        series_list = list_series_at_second(
             session=session,
             base_url=base_url,
             job=args.job,
             metric_name=args.metric,
-            lookback_days=args.lookback_days,
+            ts_int=args.ts_int,
             logger=logger,
         )
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         logger.error("Failed to list series: %s", exc)
         return 2
 
-    logger.info("Listed %d series", len(series_list))
+    logger.info("Matched %d series at second %d", len(series_list), args.ts_int)
 
-    matched, skipped_no_biz_date, skipped_unparseable = filter_series_by_biz_date(
-        series_list=series_list,
-        op_name=args.op,
-        threshold=args.threshold_date,
-        logger=logger,
-    )
-
-    logger.info(
-        "Matched %d series (skipped %d with no biz_date label, %d with unparseable biz_date)",
-        len(matched),
-        skipped_no_biz_date,
-        skipped_unparseable,
-    )
-
-    if not matched:
-        print("No series matched the biz_date filter; nothing to do.")
+    if not series_list:
+        print(f"No series had a sample at second {args.ts_int}; nothing to do.")
         return 0
 
     if args.dry_run:
         print(
-            f"[DRY RUN] {len(matched)} series would be deleted "
-            f"(biz_date {args.op} {args.threshold_date.strftime('%d/%m/%Y')}):"
+            f"[DRY RUN] {len(series_list)} series had a sample at second "
+            f"{args.ts_int} ({iso}) and would be DELETED ENTIRELY:"
         )
-        for labels in matched:
+        for labels in series_list:
             print(format_series_line(labels))
-        print(f"[DRY RUN] Total: {len(matched)} series. Re-run with --apply to delete.")
+        print(
+            f"[DRY RUN] Total: {len(series_list)} series. Re-run with --apply "
+            f"to delete. Note: delete_series drops the whole series, not just "
+            f"the targeted second."
+        )
         return 0
 
-    if not args.yes and not confirm_interactive(len(matched), args.op, args.threshold_date):
+    if not args.yes and not confirm_interactive(len(series_list), args.ts_int):
         print("Aborted by user; no series deleted.")
         return 1
 
     deleted = 0
     failed = 0
-    for labels in matched:
+    for labels in series_list:
         match_selector = labels_to_match_selector(labels)
         ok, status_code, reason = delete_series(session, base_url, match_selector, logger)
         if ok:
@@ -373,12 +316,7 @@ def run(args: argparse.Namespace) -> int:
             failed += 1
             print(f"FAIL [{status_code}] {match_selector} :: {reason}")
 
-    print(
-        f"Done. matched={len(matched)} deleted={deleted} failed={failed} "
-        f"skipped_no_biz_date={skipped_no_biz_date} "
-        f"skipped_unparseable={skipped_unparseable}"
-    )
-
+    print(f"Done. matched={len(series_list)} deleted={deleted} failed={failed}")
     return 0 if failed == 0 else 1
 
 
